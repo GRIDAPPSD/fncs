@@ -45,6 +45,8 @@ using namespace ::std;
 
 static bool is_initialized_ = false;
 static bool die_is_fatal = false;
+static bool aggregate_sub = false;
+static bool aggregate_pub = false;
 static string simulation_name = "";
 static string agent_subtopic = "Output";
 static int simulation_id = 0;
@@ -55,14 +57,19 @@ static fncs::time time_peer = 0;
 static fncs::time time_current = 0;
 static fncs::time time_window = 0;
 static zsock_t *client = NULL;
+static map<string,string> pub_cache;
 static map<string,string> cache;
 static vector<string> events;
 static set<string> keys; /* keys that other sims subscribed to */
 static vector<string> mykeys; /* keys from the fncs config file */
+static long poll_timeout = -1;
 
 static const string default_broker = "tcp://localhost:5570";
 static const string default_time_delta = "1s";
 static const string default_fatal = "yes";
+static const string default_aggregate_sub = "no";
+static const string default_aggregate_pub = "no";
+static const long   default_poll_timeout = -1;
 
 typedef map<string,vector<string> > clist_t;
 static clist_t cache_list;
@@ -334,6 +341,7 @@ void fncs::initialize(Config config)
     const char *env_name = NULL;
     const char *env_broker = NULL;
     const char *env_time_delta = NULL;
+    const char *env_poll_timeout = NULL;
     int rc;
     zmsg_t *msg = NULL;
     zchunk_t *zchunk = NULL;
@@ -377,13 +385,49 @@ void fncs::initialize(Config config)
         }
     }
 
+    /* whether we want to receive aggregate publications */
+    if (config.aggregate_sub.empty()) {
+        LINFO << "fncs config does not contain 'aggregate_sub'";
+        LINFO << "defaulting to " << default_aggregate_sub;
+        config.aggregate_sub = default_aggregate_sub;
+    }
+    {
+        char fc = config.aggregate_sub[0];
+        if (fc == 'N' || fc == 'n' || fc == 'F' || fc == 'f') {
+            LINFO << "one-shot subscription messages";
+            aggregate_sub = false;
+        }
+        else {
+            LINFO << "aggregate subscription messages";
+            aggregate_sub = true;
+        }
+    }
+
+    /* whether we want to produce aggregate publications */
+    if (config.aggregate_pub.empty()) {
+        LINFO << "fncs config does not contain 'aggregate_pub'";
+        LINFO << "defaulting to " << default_aggregate_pub;
+        config.aggregate_pub = default_aggregate_pub;
+    }
+    {
+        char fc = config.aggregate_pub[0];
+        if (fc == 'N' || fc == 'n' || fc == 'F' || fc == 'f') {
+            LINFO << "one-shot publication messages";
+            aggregate_pub = false;
+        }
+        else {
+            LINFO << "aggregate publication messages";
+            aggregate_pub = true;
+        }
+    }
+
     /* broker location from env var overrides config file */
     env_broker = getenv("FNCS_BROKER");
     if (env_broker) {
         LINFO << "FNCS_BROKER env var sets the broker endpoint location";
         config.broker = env_broker;
     } else if (config.broker.empty()) {
-        LINFO << "FNCS_BROKER env var not set and fncs config does not contain 'broker'" << endl;
+        LINFO << "FNCS_BROKER env var not set and fncs config does not contain 'broker'";
         LINFO << "defaulting to " << default_broker;
         config.broker = default_broker;
     }
@@ -395,7 +439,7 @@ void fncs::initialize(Config config)
         LINFO << "FNCS_TIME_DELTA env var sets the time_delta";
         config.time_delta = env_time_delta;
     } else if (config.time_delta.empty()) {
-        LINFO << "FNCS_TIME_DELTA env var not set and fncs config does not contain 'time_delta'" << endl;
+        LINFO << "FNCS_TIME_DELTA env var not set and fncs config does not contain 'time_delta'";
         LINFO << "defaulting to " << default_time_delta;
         config.time_delta = default_time_delta;
     }
@@ -404,6 +448,26 @@ void fncs::initialize(Config config)
     LDEBUG << "time_delta = " << time_delta;
     time_delta_multiplier = time_unit_to_multiplier(config.time_delta);
     LDEBUG << "time_delta_multiplier = " << time_delta_multiplier;
+
+    env_poll_timeout = getenv("FNCS_POLL_TIMEOUT");
+    if (env_poll_timeout) {
+        LINFO << "FNCS_POLL_TIMEOUT env var sets the poll_timeout";
+        istringstream iss(env_poll_timeout);
+        iss >> poll_timeout;
+        if (!iss) {
+            LERROR << "could not parse poll_timeout";
+            die();
+            return;
+        }
+    } else {
+        poll_timeout = default_poll_timeout;
+    }
+    LDEBUG << "poll_timeout = " << poll_timeout;
+    if (poll_timeout < -1) {
+        LERROR << "poll timeout must be >= -1";
+        die();
+        return;
+    }
 
     /* parse subscriptions */
     {
@@ -648,6 +712,19 @@ fncs::time fncs::time_request(fncs::time time_next)
         return time_next;
     }
 
+    if (aggregate_pub && !pub_cache.empty()) {
+        LDEBUG2 << "sending PUBLISH_AGGREGATE";
+        zstr_sendm(client, fncs::PUBLISH_AGGREGATE);
+        zstr_sendfm(client, "%llu", (unsigned long long)pub_cache.size());
+        for (map<string,string>::const_iterator it=pub_cache.begin();
+                it != pub_cache.end(); ++it) {
+            zstr_sendm(client, it->first.c_str());
+            zstr_sendm(client, it->second.c_str());
+        }
+        zstr_send(client, "END");
+        pub_cache.clear();
+    }
+
     fncs::time time_granted;
     fncs::time time_passed;
 
@@ -729,7 +806,7 @@ fncs::time fncs::time_request(fncs::time time_next)
         LDEBUG4 << "entering blocking poll" ;
         fncs::time poll_start = timer();
         fncs::time poll_wait = -1;
-        rc = zmq_poll(items, 1, 10000 * ZMQ_POLL_MSEC); //Wait ten seconds
+        rc = zmq_poll(items, 1, poll_timeout);
         
         // If the poll times out no items will be received.
         if (rc == 0) {
@@ -844,6 +921,74 @@ fncs::time fncs::time_request(fncs::time time_next)
                         << topic << "'";
                 }
             }
+            else if (fncs::PUBLISH_AGGREGATE == message_type) {
+                LDEBUG4 << "PUBLISH_AGGREGATE received";
+                /* next frame is topic/value count */
+                frame = zmsg_next(msg);
+                if (!frame) {
+                    LERROR << "message missing topic/value count";
+                    die();
+                    return time_next;
+                }
+                int n_topics = atoi(fncs::to_string(frame).c_str());
+                /* iterate over each topic/value pair */
+                for (int i=0; i<n_topics; ++i) {
+                    string topic;
+                    string value;
+
+                    /* next frame is topic */
+                    frame = zmsg_next(msg);
+                    if (!frame) {
+                        LERROR << "message missing topic";
+                        die();
+                        return time_next;
+                    }
+                    topic = fncs::to_string(frame);
+
+                    /* next frame is value */
+                    frame = zmsg_next(msg);
+                    if (!frame) {
+                        LERROR << "message missing value";
+                        die();
+                        return time_next;
+                    }
+                    value = fncs::to_string(frame);
+
+                    sub_string_t::const_iterator sub_str_itr;
+                    fncs::Subscription subscription;
+                    bool found = false;
+
+                    /* find cache short key */
+                    sub_str_itr = subs_string.find(topic);
+                    if (sub_str_itr != subs_string.end()) {
+                        found = true;
+                        subscription = sub_str_itr->second;
+                    }
+
+                    /* if found then store in cache */
+                    if (found) {
+                        events.push_back(subscription.key);
+                        if (subscription.is_list()) {
+                            cache_list[subscription.key].push_back(value);
+                            LDEBUG4 << "updated cache_list "
+                                << "key='" << subscription.key << "' "
+                                << "topic='" << topic << "' "
+                                << "value='" << value << "' "
+                                << "count=" << cache_list[subscription.key].size();
+                        } else {
+                            cache[subscription.key] = value;
+                            LDEBUG4 << "updated cache "
+                                << "key='" << subscription.key << "' "
+                                << "topic='" << topic << "' ";
+                            // << "value='" << value << "' ";
+                        }
+                    }
+                    else {
+                        LDEBUG4 << "dropping PUBLISH_AGGREGATE message topic='"
+                            << topic << "'";
+                    }
+                }
+            }
             else if  (fncs::DIE == message_type){
                 poll_wait = timer() - poll_start;
                 LDEBUG4 << "DIE recieved " << poll_wait << " seconds after entering blocking poll";
@@ -908,10 +1053,16 @@ void fncs::publish(const string &key, const string &value)
 
     if (keys.count(key)) {
         string new_key = simulation_name + '/' + key;
-        zstr_sendm(client, fncs::PUBLISH);
-        zstr_sendm(client, new_key.c_str());
-        zstr_send(client, value.c_str());
-        LDEBUG4 << "sent PUBLISH '" << new_key; // << "'='" << value << "'";
+        if (aggregate_pub) {
+            pub_cache[new_key] = value;
+            LDEBUG4 << "cached PUBLISH '" << new_key << "'='" << value << "'";
+        }
+        else {
+            zstr_sendm(client, fncs::PUBLISH);
+            zstr_sendm(client, new_key.c_str());
+            zstr_send(client, value.c_str());
+            LDEBUG4 << "sent PUBLISH '" << new_key << "'='" << value << "'";
+        }
     }
     else {
         LDEBUG4 << "dropped " << key;
@@ -928,10 +1079,16 @@ void fncs::publish_anon(const string &key, const string &value)
         return;
     }
 
-    zstr_sendm(client, fncs::PUBLISH);
-    zstr_sendm(client, key.c_str());
-    zstr_send(client, value.c_str());
-    LDEBUG4 << "sent PUBLISH anon '" << key << "'='" << value << "'";
+    if (aggregate_pub) {
+        pub_cache[key] = value;
+        LDEBUG4 << "cached PUBLISH anon '" << key << "'='" << value << "'";
+    }
+    else {
+        zstr_sendm(client, fncs::PUBLISH);
+        zstr_sendm(client, key.c_str());
+        zstr_send(client, value.c_str());
+        LDEBUG4 << "sent PUBLISH anon '" << key << "'='" << value << "'";
+    }
 }
 
 
@@ -966,10 +1123,17 @@ void fncs::route(
     }
 
     string new_key = simulation_name + '/' + from + '@' + to + '/' + key;
-    zstr_sendm(client, fncs::PUBLISH);
-    zstr_sendm(client, new_key.c_str());
-    zstr_send(client, value.c_str());
-    LDEBUG4 << "sent PUBLISH '" << new_key << "'='" << value << "'";
+
+    if (aggregate_pub) {
+        pub_cache[new_key] = value;
+        LDEBUG4 << "cached PUBLISH '" << new_key << "'='" << value << "'";
+    }
+    else {
+        zstr_sendm(client, fncs::PUBLISH);
+        zstr_sendm(client, new_key.c_str());
+        zstr_send(client, value.c_str());
+        LDEBUG4 << "sent PUBLISH '" << new_key << "'='" << value << "'";
+    }
 }
 
 
@@ -1112,6 +1276,9 @@ void fncs::update_time_delta(fncs::time delta)
     LDEBUG4 << "sending TIME_DELTA of " << delta << " nanoseconds";
     zstr_sendm(client, fncs::TIME_DELTA);
     zstr_sendf(client, "%llu", delta);
+
+    /* update our client-side value */
+    time_delta = delta;
 }
 
 
@@ -1336,6 +1503,24 @@ fncs::Config fncs::parse_config(const YAML::Node &doc)
         }
     }
 
+    if (const YAML::Node *node = doc.FindValue("aggregate_sub")) {
+        if (node->Type() != YAML::NodeType::Scalar) {
+            cerr << "YAML 'aggregate_sub' must be a Scalar" << endl;
+        }
+        else {
+            *node >> config.aggregate_sub;
+        }
+    }
+
+    if (const YAML::Node *node = doc.FindValue("aggregate_pub")) {
+        if (node->Type() != YAML::NodeType::Scalar) {
+            cerr << "YAML 'aggregate_pub' must be a Scalar" << endl;
+        }
+        else {
+            *node >> config.aggregate_pub;
+        }
+    }
+
     /* parse subscriptions */
     if (const YAML::Node *node = doc.FindValue("values")) {
         config.values = parse_values(*node);
@@ -1363,6 +1548,12 @@ fncs::Config fncs::parse_config(zconfig_t *zconfig)
 
     /* read whether die() is fatal from zconfig */
     config.fatal = zconfig_resolve(zconfig, "/fatal", "");
+
+    /* read whether received messages are aggregated from zconfig */
+    config.aggregate_sub = zconfig_resolve(zconfig, "/aggregate_sub", "");
+
+    /* read whether published messages are aggregated from zconfig */
+    config.aggregate_pub = zconfig_resolve(zconfig, "/aggregate_pub", "");
 
     /* parse subscriptions */
     config_values = zconfig_locate(zconfig, "/values");
